@@ -16,9 +16,37 @@
 """Thinker NPU patches adapted from https://github.com/verl-project/verl/pull/7960."""
 
 import logging
+import os
+from functools import wraps
 from typing import Any
 
 logger = logging.getLogger(__name__)
+_experts_call_logged = False
+
+
+def _with_first_experts_call_log(experts_cls, forward):
+    @wraps(forward)
+    def first_forward(self, hidden_states, top_k_index, top_k_weights):
+        global _experts_call_logged
+
+        output = forward(self, hidden_states, top_k_index, top_k_weights)
+        if not _experts_call_logged:
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_initialized() else "uninitialized"
+            print(
+                f"[Qwen3-Omni NPU] first MoE forward: qwen3_5_moe_experts_forward_npu "
+                f"pid={os.getpid()} rank={rank} device={hidden_states.device} "
+                f"dtype={hidden_states.dtype} shape={tuple(hidden_states.shape)}",
+                flush=True,
+            )
+            _experts_call_logged = True
+        # Remove the logging wrapper from subsequent forwards, including recomputation.
+        if experts_cls.forward is first_forward:
+            experts_cls.forward = forward
+        return output
+
+    return first_forward
 
 
 def apply_qwen3_omni_thinker_npu_patch(text_config: Any) -> None:
@@ -54,5 +82,9 @@ def apply_qwen3_omni_thinker_npu_patch(text_config: Any) -> None:
 
     for module_cls, forward in patches:
         module_cls.forward = forward
+    if not _experts_call_logged:
+        modeling.Qwen3OmniMoeThinkerTextExperts.forward = _with_first_experts_call_log(
+            modeling.Qwen3OmniMoeThinkerTextExperts, qwen3_5_moe_experts_forward_npu
+        )
     modeling.apply_rotary_pos_emb = apply_rotary_pos_emb
     logger.info("Applied Qwen3-Omni Thinker NPU patches: experts, RMSNorm, MLP and RoPE")
