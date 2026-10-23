@@ -61,13 +61,14 @@ def patch_env(monkeypatch):
     return patch, modeling, kernels
 
 
-def test_patch_covers_final_norm_and_preserves_talker(patch_env):
+def test_patch_covers_final_norm_and_preserves_experts_and_talker(patch_env):
     patch, modeling, kernels = patch_env
+    experts = modeling.Qwen3OmniMoeThinkerTextExperts.forward
     talker = modeling.Qwen3OmniMoeTalkerTextExperts.forward
     talker_mlp = modeling.Qwen3OmniMoeTalkerTextMLP.forward
     for _ in range(2):
         patch.apply_qwen3_omni_thinker_npu_patch(SimpleNamespace(hidden_act="silu"))
-        assert modeling.Qwen3OmniMoeThinkerTextExperts.forward.__wrapped__ is kernels.qwen3_5_moe_experts_forward_npu
+        assert modeling.Qwen3OmniMoeThinkerTextExperts.forward is experts
         assert modeling.Qwen3OmniMoeThinkerTextRMSNorm.forward is kernels.rms_norm_forward_npu
         assert modeling.Qwen3OmniMoeTextRMSNorm.forward is kernels.rms_norm_forward_npu
         assert modeling.Qwen3OmniMoeThinkerTextMLP.forward is kernels.silu_forward_npu
@@ -120,6 +121,7 @@ def test_patch_reaches_already_loaded_transformers_modules(monkeypatch):
         modeling.Qwen3OmniMoeThinkerTextRMSNorm(128),
         modeling.Qwen3OmniMoeTextRMSNorm(128),
     ]
+    experts_forward = type(layers[0]).forward
     parameters = [dict(layer.named_parameters()) for layer in layers]
     for layer in layers:
         monkeypatch.setattr(type(layer), "forward", type(layer).forward)
@@ -139,53 +141,22 @@ def test_patch_reaches_already_loaded_transformers_modules(monkeypatch):
     patch.apply_qwen3_omni_thinker_npu_patch(config)
     hidden_states = SimpleNamespace(device="cpu", dtype="float32", shape=(16, 128))
     for layer, original_parameters in zip(layers, parameters, strict=True):
-        inputs = (hidden_states, object(), object()) if layer is layers[0] else (hidden_states,)
-        instance, args = layer(*inputs)
-        assert instance is layer
-        assert args == inputs
+        if layer is layers[0]:
+            assert type(layer).forward is experts_forward
+        else:
+            inputs = (hidden_states,)
+            instance, args = layer(*inputs)
+            assert instance is layer
+            assert args == inputs
         assert dict(layer.named_parameters()).keys() == original_parameters.keys()
         assert all(param is original_parameters[name] for name, param in layer.named_parameters())
 
 
-def test_first_experts_call_logs_once_and_removes_wrapper(patch_env, capsys, monkeypatch):
-    import torch.distributed as dist
-
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_rank", lambda: 3)
-    patch, modeling, kernels = patch_env
-    monkeypatch.setattr(patch.os, "getpid", lambda: 12345)
-    config = SimpleNamespace(hidden_act="silu")
-    patch.apply_qwen3_omni_thinker_npu_patch(config)
-    cls = modeling.Qwen3OmniMoeThinkerTextExperts
-    wrapped_forward = cls.forward
-    instance = cls()
-    hidden_states = SimpleNamespace(device="npu:3", dtype="torch.bfloat16", shape=(16, 128))
-    indices, weights = object(), object()
-    assert capsys.readouterr().out == ""
-
-    result = instance.forward(hidden_states, indices, weights)
-    kernels.qwen3_5_moe_experts_forward_npu.assert_called_once_with(instance, hidden_states, indices, weights)
-    assert result is kernels.qwen3_5_moe_experts_forward_npu.return_value
-    assert cls.forward is kernels.qwen3_5_moe_experts_forward_npu
-    log = capsys.readouterr().out
-    assert log.count("first MoE forward") == 1
-    assert "pid=12345 rank=3 device=npu:3 dtype=torch.bfloat16 shape=(16, 128)" in log
-
-    cls.forward(instance, hidden_states, indices, weights)
-    wrapped_forward(instance, hidden_states, indices, weights)
-    patch.apply_qwen3_omni_thinker_npu_patch(config)
-    assert cls.forward is kernels.qwen3_5_moe_experts_forward_npu
-    assert capsys.readouterr().out == ""
-
-
-def test_failed_experts_call_does_not_report_success(patch_env, capsys):
-    patch, modeling, kernels = patch_env
-    kernels.qwen3_5_moe_experts_forward_npu.side_effect = RuntimeError("kernel failed")
-    patch.apply_qwen3_omni_thinker_npu_patch(SimpleNamespace(hidden_act="silu"))
-    with pytest.raises(RuntimeError, match="kernel failed"):
-        modeling.Qwen3OmniMoeThinkerTextExperts().forward(object(), object(), object())
-    assert not patch._experts_call_logged
-    assert capsys.readouterr().out == ""
+def test_patch_log_reports_disabled_experts(patch_env, caplog):
+    patch, _, _ = patch_env
+    with caplog.at_level("INFO", logger=patch.logger.name):
+        patch.apply_qwen3_omni_thinker_npu_patch(SimpleNamespace(hidden_act="silu"))
+    assert "RMSNorm, MLP and RoPE; MoE experts patch disabled" in caplog.text
 
 
 @pytest.mark.parametrize("on_npu", [False, True])
