@@ -47,7 +47,6 @@ def patch_env(monkeypatch):
     modeling.apply_rotary_pos_emb = Mock(name="original_rope")
     kernels = ModuleType("verl.models.transformers.npu_patch")
     for name in (
-        "qwen3_5_moe_experts_forward_npu",
         "rms_norm_forward_npu",
         "silu_forward_npu",
         "apply_rotary_pos_emb_npu",
@@ -61,14 +60,13 @@ def patch_env(monkeypatch):
     return patch, modeling, kernels
 
 
-def test_patch_covers_final_norm_and_preserves_experts_and_talker(patch_env):
+def test_patch_covers_experts_and_final_norm_and_preserves_talker(patch_env):
     patch, modeling, kernels = patch_env
-    experts = modeling.Qwen3OmniMoeThinkerTextExperts.forward
     talker = modeling.Qwen3OmniMoeTalkerTextExperts.forward
     talker_mlp = modeling.Qwen3OmniMoeTalkerTextMLP.forward
     for _ in range(2):
         patch.apply_qwen3_omni_thinker_npu_patch(SimpleNamespace(hidden_act="silu"))
-        assert modeling.Qwen3OmniMoeThinkerTextExperts.forward is experts
+        assert modeling.Qwen3OmniMoeThinkerTextExperts.forward is patch.qwen3_omni_experts_forward_npu
         assert modeling.Qwen3OmniMoeThinkerTextRMSNorm.forward is kernels.rms_norm_forward_npu
         assert modeling.Qwen3OmniMoeTextRMSNorm.forward is kernels.rms_norm_forward_npu
         assert modeling.Qwen3OmniMoeThinkerTextMLP.forward is kernels.silu_forward_npu
@@ -121,7 +119,6 @@ def test_patch_reaches_already_loaded_transformers_modules(monkeypatch):
         modeling.Qwen3OmniMoeThinkerTextRMSNorm(128),
         modeling.Qwen3OmniMoeTextRMSNorm(128),
     ]
-    experts_forward = type(layers[0]).forward
     parameters = [dict(layer.named_parameters()) for layer in layers]
     for layer in layers:
         monkeypatch.setattr(type(layer), "forward", type(layer).forward)
@@ -131,32 +128,29 @@ def test_patch_reaches_already_loaded_transformers_modules(monkeypatch):
         return self, args
 
     kernels = SimpleNamespace(
-        qwen3_5_moe_experts_forward_npu=forward,
         rms_norm_forward_npu=forward,
         silu_forward_npu=forward,
         apply_rotary_pos_emb_npu=Mock(),
     )
     monkeypatch.setitem(sys.modules, "verl.models.transformers.npu_patch", kernels)
     patch = _load("verl_omni/models/transformers/qwen3_omni_npu.py", "qwen3_omni_npu_real_classes")
+    monkeypatch.setattr(patch, "qwen3_omni_experts_forward_npu", forward)
     patch.apply_qwen3_omni_thinker_npu_patch(config)
     hidden_states = SimpleNamespace(device="cpu", dtype="float32", shape=(16, 128))
     for layer, original_parameters in zip(layers, parameters, strict=True):
-        if layer is layers[0]:
-            assert type(layer).forward is experts_forward
-        else:
-            inputs = (hidden_states,)
-            instance, args = layer(*inputs)
-            assert instance is layer
-            assert args == inputs
+        inputs = (hidden_states,)
+        instance, args = layer(*inputs)
+        assert instance is layer
+        assert args == inputs
         assert dict(layer.named_parameters()).keys() == original_parameters.keys()
         assert all(param is original_parameters[name] for name, param in layer.named_parameters())
 
 
-def test_patch_log_reports_disabled_experts(patch_env, caplog):
+def test_patch_log_reports_gmm_experts(patch_env, caplog):
     patch, _, _ = patch_env
     with caplog.at_level("INFO", logger=patch.logger.name):
         patch.apply_qwen3_omni_thinker_npu_patch(SimpleNamespace(hidden_act="silu"))
-    assert "RMSNorm, MLP and RoPE; MoE experts patch disabled" in caplog.text
+    assert "MoE GMM, RMSNorm, MLP and RoPE" in caplog.text
 
 
 @pytest.mark.parametrize("on_npu", [False, True])
